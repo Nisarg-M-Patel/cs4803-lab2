@@ -1,0 +1,10 @@
+Metadata-Version: 2.1
+Name: calculon
+Version: 0.1.0
+Summary: Co-design for large scale parallel applications
+Home-page: http://github.com/calculon-ai/calculon
+Author: Michael Isaev
+Author-email: michael.v.isaev@gmail.com
+License: Apache 2
+License-File: LICENSE
+License-File: NOTICE
