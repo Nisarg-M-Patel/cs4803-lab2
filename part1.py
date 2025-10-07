@@ -17,74 +17,50 @@ async def part1_training_loop(model: Model, batch_size: int) -> Model:
     Coordinate parameter updates and gradient reductions across GPUs.
     Implement efficient memory management by only creating the full model params when needed
     """
-    #import the get next microbatch, similiar to part 0
     from utils import get_next_microbatch
-    #get the model storage and parse into variables
-    weights, optStates, activations, activationGrads, grad_weights = model.storage()
-
-    #shard weights for all layers 1/world_size
-    for layer in range(model.num_layers):
-        weights[layer], optStates[layer] = model.load_weights(
-            layer,
-            model.rank,
-            model.world_size
+    
+    weights, opt_states, activations, grad_activations, grad_weights = model.storage()
+    
+    for l in range(model.num_layers):
+        weights[l], opt_states[l] = model.load_weights(
+            l, model.rank, model.world_size
         )
     
-    #forward pass and backpropogate microbatches
     for microbatch in get_next_microbatch(
-        model.global_batch_size,
-        model.world_size,
-        batch_size,
-        model.rank
-        ):
-        #input activations
+        model.global_batch_size, model.world_size, batch_size, model.rank
+    ):
         activations[0] = model.get_input_activation(microbatch)
-
-        # Forward pass
-        for layer in range(model.num_layers):
-            #save the shard
-            shard = weights[layer]
-            #gather full weights
-            weights[layer] = await model.all_gather(weights[layer], layer)
-            activations[layer + 1] = model.forward(layer, activations[layer], weights[layer])
-            #restore shard
-            weights[layer] = shard
         
-        #loss
-        activationGrads[model.num_layers] = model.loss(activations[model.num_layers])
+        for l in range(model.num_layers):
+            weight_shard = weights[l]
+            weights[l] = await model.all_gather(weights[l], l)
+            activations[l + 1] = model.forward(l, activations[l], weights[l])
+            weights[l] = weight_shard
         
-        #backward pass
-        for layer in range(model.num_layers - 1, -1, -1):
-            #save shard
-            shard = weights[layer]
-            #gather weights
-            weights[layer] = await model.all_gather(weights[layer], layer)
-            new_gradient, activationGrads[layer] = model.backward(
-                layer, activations[layer], activationGrads[layer + 1], weights[layer]
+        grad_activations[model.num_layers] = model.loss(activations[model.num_layers])
+        
+        for l in range(model.num_layers - 1, -1, -1):
+            weight_shard = weights[l]
+            weights[l] = await model.all_gather(weights[l], l)
+            new_grad, grad_activations[l] = model.backward(
+                l, activations[l], grad_activations[l + 1], weights[l]
             )
-            #restore shard
-            weights[layer] = shard
-            
-            del activationGrads[layer + 1], activations[layer]
-            
-            #accumulate gradients
-            if layer not in grad_weights:
-                grad_weights[layer] = new_gradient
+            weights[l] = weight_shard
+            del grad_activations[l + 1], activations[l]
+            new_grad = await model.reduce_scatter(new_grad, l)
+            if l not in grad_weights:
+                grad_weights[l] = new_grad
             else:
-                grad_weights[layer] += new_gradient
+                grad_weights[l] += new_grad
     
-    #reduce-scatter gradients
-    for layer in range(model.num_layers):
-        grad_weights[layer] = await model.reduce_scatter(grad_weights[layer], layer)
-    
-    #update param
-    for layer in range(model.num_layers):
-        weights[layer], optStates[layer] = model.update(
-            layer, grad_weights[layer], weights[layer], optStates[layer]
+    for l in range(model.num_layers):
+        weights[l], opt_states[l] = model.update(
+            l, grad_weights[l], weights[l], opt_states[l]
         )
-        model.set_final_weight(layer, weights[layer])
+        model.set_final_weight(l, weights[l])
     
     return model
+
 
 async def main():
     world_size = 32
