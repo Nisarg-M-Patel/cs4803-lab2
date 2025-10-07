@@ -1,0 +1,6 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Debug traces
+debug_traces/
