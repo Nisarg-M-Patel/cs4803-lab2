@@ -22,14 +22,112 @@ async def part3_training_loop(model: Model, batch_size: int) -> Model:
 
     Use `model.send` and `model.receive` to pass data between different world_size. See `lib.py` for more details on these functions.
     """
-    raise NotImplementedError
+    from utils import get_global_batch_list
+    weights, opt_states, activations, grad_activations, grad_weights = model.storage()
 
+    layers_per_rank = model.num_layers // model.world_size
+    start_layer = model.rank * layers_per_rank
+    end_layer = start_layer + layers_per_rank
+
+    for layer in range(start_layer, end_layer):
+        weights[layer], opt_states[layer] = model.load_weights(layer)
+
+    microbatches = get_global_batch_list(model.global_batch_size, batch_size)
+    num_microbatches = len(microbatches)
+    pipeline_size = model.world_size
+
+    num_warmup_microbatches = min(
+        num_microbatches, pipeline_size - model.rank - 1
+    )
+    num_steady_state_iters = num_microbatches - num_warmup_microbatches
+
+    async def forward_step(microbatch_id: int) -> None:
+        if model.rank == 0:
+            samples = microbatches[microbatch_id]
+            activations[(start_layer, microbatch_id)] = model.get_input_activation(
+                samples
+            )
+        else:
+            activations[(start_layer, microbatch_id)] = await model.receive(
+                model.rank - 1
+            )
+
+        for layer in range(start_layer, end_layer):
+            activations[(layer + 1, microbatch_id)] = model.forward(
+                layer, activations[(layer, microbatch_id)], weights[layer]
+            )
+
+        if model.rank == pipeline_size - 1:
+            grad_activations[(end_layer, microbatch_id)] = model.loss(
+                activations[(end_layer, microbatch_id)]
+            )
+        else:
+            await model.send(model.rank + 1, activations[(end_layer, microbatch_id)])
+
+    async def backward_step(microbatch_id: int) -> None:
+        if model.rank != pipeline_size - 1 and (
+            (end_layer, microbatch_id) not in grad_activations
+        ):
+            grad_activations[(end_layer, microbatch_id)] = await model.receive(
+                model.rank + 1
+            )
+
+        for layer in range(end_layer - 1, start_layer - 1, -1):
+            grad_weight, grad_activations[(layer, microbatch_id)] = model.backward(
+                layer,
+                activations[(layer, microbatch_id)],
+                grad_activations[(layer + 1, microbatch_id)],
+                weights[layer],
+            )
+
+            if layer not in grad_weights:
+                grad_weights[layer] = grad_weight
+            else:
+                grad_weights[layer] += grad_weight
+
+            del grad_activations[(layer + 1, microbatch_id)]
+            del activations[(layer + 1, microbatch_id)]
+
+        if model.rank > 0:
+            await model.send(
+                model.rank - 1, grad_activations[(start_layer, microbatch_id)]
+            )
+
+        del grad_activations[(start_layer, microbatch_id)]
+        del activations[(start_layer, microbatch_id)]
+
+    forward_microbatch = 0
+    backward_microbatch = 0
+
+    for _ in range(num_warmup_microbatches):
+        await forward_step(forward_microbatch)
+        forward_microbatch += 1
+
+    for _ in range(num_steady_state_iters):
+        await forward_step(forward_microbatch)
+        forward_microbatch += 1
+
+        await backward_step(backward_microbatch)
+        backward_microbatch += 1
+
+    remaining_backwards = num_microbatches - backward_microbatch
+    for _ in range(remaining_backwards):
+        await backward_step(backward_microbatch)
+        backward_microbatch += 1
+
+    for layer in range(start_layer, end_layer):
+        weights[layer], opt_states[layer] = model.update(
+            layer, grad_weights[layer], weights[layer], opt_states[layer]
+        )
+        model.set_final_weight(layer, weights[layer])
+
+    return model
 
 async def main():
-    world_size = 16
-    num_layers = 32
-    global_batch_size = 2048
-    batch_size = 128
+    world_size = 4
+    num_layers = 4
+    global_batch_size = 512
+    batch_size = 64
 
     global_microbatches = []
     for i in range(global_batch_size // batch_size):
