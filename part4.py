@@ -95,17 +95,33 @@ async def part4_training_loop(model: Model, batch_size: int) -> Model:
         grad_activations.clear()
         activations[0] = model.get_input_activation(microbatch)
 
+        pending_activation_drops = set()
+
         for layer in range(model.num_layers):
+            # Drop any pending activations whose layer index is safely behind the
+            # current forward position. These activations have already been used
+            # for forward propagation and are not checkpoints, so they can be
+            # recomputed later if needed during the backward pass.
+            for drop_idx in list(pending_activation_drops):
+                if drop_idx < layer:
+                    if drop_idx in activations:
+                        del activations[drop_idx]
+                    pending_activation_drops.remove(drop_idx)
+
             weight_shard = weights[layer]
             weights[layer] = await model.all_gather(weights[layer], layer)
             activations[layer + 1] = model.forward(layer, activations[layer], weights[layer])
             weights[layer] = weight_shard
 
             # Drop activations that are not checkpoints to enable recomputation.
-            if not should_checkpoint(layer) and layer in activations:
-                del activations[layer]
+            if not should_checkpoint(layer):
+                pending_activation_drops.add(layer)
             if not should_checkpoint(layer + 1) and (layer + 1) != model.num_layers:
-                del activations[layer + 1]
+                pending_activation_drops.add(layer + 1)
+
+        for drop_idx in pending_activation_drops:
+            if drop_idx in activations:
+                del activations[drop_idx]
 
         grad_activations[model.num_layers] = model.loss(activations[model.num_layers])
 
